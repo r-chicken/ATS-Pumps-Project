@@ -795,9 +795,9 @@ def acceleration_enveloping_priority_hint(amp: float) -> int:
     problem - don't try to fix it by moving these two further without new
     evidence that the underlying relationship has changed.
     """
-    if amp > 0.45:
+    if amp > 0.475:
         return 1
-    if amp >= 0.3:
+    if amp >= 0.275:
         return 2
     if amp >= 0.09:
         return 3
