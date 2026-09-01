@@ -275,40 +275,79 @@ def _read_y_axis_ticks(panel: Image.Image) -> tuple[list[tuple[float, float]], f
       edge and keeps only the largest cluster - reliably keeps the real
       ticks and drops the rest, even when a couple of them have very low
       OCR confidence (confidence alone was tried and wasn't reliable
-      enough to use as the primary filter here).
+      enough to use as the primary filter here). It's used as a tie-
+      breaker between same-size clusters, though - confirmed on a real
+      report where a rotated fault-frequency callout (a "Fund Amp: ..."
+      readout and a bearing-defect label, both printed in the plot's top-
+      left corner, right where the y-axis's own top tick labels are)
+      happened to right-align within the clustering tolerance of each
+      other AND tie the real tick cluster's size, so whichever cluster's
+      tokens Tesseract happened to emit first (scan order, not anything
+      meaningful) silently won - here, the annotation cluster, leaving
+      nothing usable to calibrate against. Every real tick label seen
+      across every report tested OCRs at 88+ confidence; every spurious
+      token from rotated/decorative annotation text seen OCRs at 0 - not
+      close enough to call reliable on its own (hence not the primary
+      filter), but a clean way to prefer the real cluster on an exact
+      count tie rather than leaving it to scan order.
+    - A single tick label can be missing from one psm pass entirely, or
+      have its digits garbled, while a DIFFERENT pass reads it cleanly -
+      confirmed on two real reports where Tesseract's default assumed-
+      layout mode (--psm 6, "one uniform block of text") merged/dropped a
+      label sitting close above or below another one (a "1" tick directly
+      under a "1.05" one; a "0.5" tick swallowed by a nearby callout's
+      dotted leader line), while --psm 6 misread a THIRD (a lone "0.2")
+      that --psm 6's own neighbor-relative digit model got dragged off by
+      an adjacent "92"-shaped fragment above it. --psm 11 ("sparse text,
+      no assumed layout") reads each of those correctly where 6 didn't -
+      but flips the failure the other way on a label 6 already had right
+      (misread "1.5" as "15", decimal dropped), so it's not a strict
+      upgrade to switch to on its own. Both passes run and their
+      candidates POOL into one list rather than one replacing the other -
+      safe to do because a wrong token from either pass (a stray "15", a
+      misread "99") almost never lands on the real calibration line, so
+      _ransac_calibration's existing outlier rejection (built to survive
+      exactly this kind of single bad token) discards it same as always;
+      meanwhile a label only one pass caught cleanly now has a chance to
+      make it into the kept set at all, instead of leaving a gap
+      _floor_to_axis_label has nothing to floor down to.
     """
     import pytesseract
 
     cw, ch = panel.size
     strip = panel.crop((0, 0, int(cw * Y_LABEL_STRIP_WFRAC), ch))
     strip_up = strip.resize((strip.size[0] * OCR_UPSCALE, strip.size[1] * OCR_UPSCALE), Image.LANCZOS)
-    data = pytesseract.image_to_data(
-        strip_up,
-        config="--psm 6 -c tessedit_char_whitelist=0123456789.",
-        output_type=pytesseract.Output.DICT,
-    )
 
     candidates = []
-    for i in range(len(data["text"])):
-        text = data["text"][i].strip()
-        if not text or not re.fullmatch(r"\d+\.\d+|\d+", text):
-            continue
-        row = (data["top"][i] + data["height"][i] / 2) / OCR_UPSCALE
-        right_edge = (data["left"][i] + data["width"][i]) / OCR_UPSCALE
-        candidates.append((row, float(text), right_edge))
+    for psm in (6, 11):
+        data = pytesseract.image_to_data(
+            strip_up,
+            config=f"--psm {psm} -c tessedit_char_whitelist=0123456789.",
+            output_type=pytesseract.Output.DICT,
+        )
+        for i in range(len(data["text"])):
+            text = data["text"][i].strip()
+            if not text or not re.fullmatch(r"\d+\.\d+|\d+", text):
+                continue
+            row = (data["top"][i] + data["height"][i] / 2) / OCR_UPSCALE
+            right_edge = (data["left"][i] + data["width"][i]) / OCR_UPSCALE
+            conf = float(data["conf"][i])
+            candidates.append((row, float(text), right_edge, conf))
 
     if not candidates:
         return [], None
 
     edges = np.array([c[2] for c in candidates])
-    best_center, best_count = edges[0], 0
+    confs = np.array([c[3] for c in candidates])
+    best_center, best_score = edges[0], (0, -1.0)
     for e in edges:
-        count = int(np.sum(np.abs(edges - e) <= 4))
-        if count > best_count:
-            best_count, best_center = count, e
+        mask = np.abs(edges - e) <= 4
+        score = (int(mask.sum()), float(confs[mask].sum()))
+        if score > best_score:
+            best_score, best_center = score, e
 
     points = sorted(
-        {(row, val) for row, val, edge in candidates if abs(edge - best_center) <= 4},
+        {(row, val) for row, val, edge, _conf in candidates if abs(edge - best_center) <= 4},
         key=lambda p: p[1],
     )
     return points, float(best_center)
@@ -459,20 +498,32 @@ def _find_peak_pixel(arr: np.ndarray, left: int, right: int, top: int, bottom: i
        same topmost ink row. A real spectral peak is one frequency wide,
        at most a couple of pixels - so any run of more than
        MAX_PLATEAU_WIDTH_PX columns at the same height is a block, not
-       data. Applies regardless of color - a genuine trace essentially
-       never forms a flat multi-column plateau (real spectral noise is
-       jagged), so this is safe to apply universally. A column inside a
-       detected block does NOT just get dropped, though - it gets peeled:
-       the block's own run in that column is skipped, and whatever ink
-       comes after it (below it) in that same column is looked at next,
-       same as for a tall thin mark below. This matters because a marker
-       can sit directly ON TOP of genuine data in the same column, not
-       just next to it - confirmed on a real report, a bar box + its
-       callout line hid a real peak that was over a full labeled gridline
-       taller than the peak this function used to report before that
-       column was ever looked at below the box. See MAX_PEEL_PASSES for
-       how many stacked layers one column can have peeled before giving up
-       on it.
+       data - EXCEPT a column that's already blue-dominant there
+       (_is_blue_ish, same test point 2 uses) is excluded from that count
+       and left alone entirely, not just exempted from the cap. Two real
+       reports needed this: a rotated harmonic-flag label box sitting
+       directly on top of a severe peak (the box's bottom edge touches the
+       peak's tip with no row gap, so without the exemption the peak's own
+       column reads as just more of the same plateau), and, separately, a
+       severe peak with no marker involved at all, whose own several
+       antialiased-width columns near its near-vertical rise were on their
+       own enough columns to exceed MAX_PLATEAU_WIDTH_PX. A plain "applies
+       regardless of color" version of this check (tried first) reads
+       either of those as a wide block and erases the peak along with it -
+       exactly backwards, same failure shape as the height cap in point 2
+       ignoring blue would have, and for the same reason: the taller and
+       more severe a real peak is, the more columns of its own width look
+       "flat" by this test. A column inside a detected block does NOT just
+       get dropped, though - it gets peeled: the block's own run in that
+       column is skipped, and whatever ink comes after it (below it) in
+       that same column is looked at next, same as for a tall thin mark
+       below. This matters because a marker can sit directly ON TOP of
+       genuine data in the same column, not just next to it - confirmed on
+       a real report, a bar box + its callout line hid a real peak that
+       was over a full labeled gridline taller than the peak this function
+       used to report before that column was ever looked at below the box.
+       See MAX_PEEL_PASSES for how many stacked layers one column can have
+       peeled before giving up on it.
     2. Tall thin marks that AREN'T richly-saturated blue - rotated
        marker-label text, a UI cursor/order-marker line (e.g. red, with a
        small square handle sitting right at/above the frame's top edge -
@@ -615,20 +666,50 @@ def _find_peak_pixel(arr: np.ndarray, left: int, right: int, top: int, bottom: i
             while c2 + 1 < W and topmost[c2 + 1] != H and abs(int(topmost[c2 + 1]) - int(topmost[c])) <= PLATEAU_ROW_TOL_PX:
                 c2 += 1
             if c2 - c + 1 > MAX_PLATEAU_WIDTH_PX:
-                any_wide = True
-                # Shared floor = just past the farthest this block's own
-                # (gap-merged) ink reaches, across every column in it -
-                # not just the shallowest one, so a stray deeper column
-                # doesn't leave the rest of the block only half-cleared.
-                block_end = 0
+                # A candidate plateau can accidentally rope in a genuine
+                # peak's own column(s) alongside real marker ink - not
+                # because the peak IS a marker, but because something
+                # shares its topmost row closely enough to read as the same
+                # plateau. Confirmed on two real reports: a harmonic-flag
+                # label box sitting directly on top of a severe peak (the
+                # box's bottom edge touches the peak's tip, no row gap
+                # between them), and, separately, a severe peak with no
+                # marker involved at all, whose own several antialiased-
+                # width columns near its near-vertical rise were enough
+                # columns on their own to exceed MAX_PLATEAU_WIDTH_PX.
+                # Either way the fix is the same: a column that's already
+                # blue-dominant (_is_blue_ish - the same test Stage 2 below
+                # uses to exempt a tall run from its own height cap) is
+                # real trace data, not marker ink, so it's excluded here
+                # too - both from the count that decides whether this is
+                # actually a wide block, and from the shared floor push,
+                # so its own ink is left completely alone for Stage 2 to
+                # read normally. Without this, the shared floor (next
+                # paragraph) gets computed from - and then applied to - a
+                # peak that was never part of the marker to begin with,
+                # which silently erases it.
+                marker_cols = []
                 for cc in range(c, c2 + 1):
                     idx = np.where(ink[:, cc])[0]
                     idx = idx[idx >= floor[cc]]
                     if len(idx) == 0:
                         continue
-                    block_end = max(block_end, int(_first_run(idx, cc)[-1]))
-                for cc in range(c, c2 + 1):
-                    floor[cc] = block_end + 1
+                    fr = _first_run(idx, cc)
+                    if _is_blue_ish(region[fr, cc]).mean() >= BLUE_ISH_MIN_FRAC:
+                        continue
+                    marker_cols.append((cc, int(fr[-1])))
+
+                if len(marker_cols) > MAX_PLATEAU_WIDTH_PX:
+                    any_wide = True
+                    # Shared floor = just past the farthest this block's own
+                    # (gap-merged) ink reaches, across every marker column in
+                    # it - not just the shallowest one, so a stray deeper
+                    # column doesn't leave the rest of the block only half-
+                    # cleared. Blue-dominant columns (excluded above) never
+                    # contribute to this, and never get it applied to them.
+                    block_end = max(end for _, end in marker_cols)
+                    for cc, _end in marker_cols:
+                        floor[cc] = block_end + 1
             c = c2 + 1
         if not any_wide:
             break
@@ -678,14 +759,68 @@ def _find_peak_pixel(arr: np.ndarray, left: int, right: int, top: int, bottom: i
     return y0 + int(resolved_topmost[best_col]), left + 2 + best_col
 
 
+def _infer_grid_ticks(values: set[float]) -> set[float]:
+    """Fill in gridline VALUES that sit strictly between two already-OCR'd
+    tick labels, when doing so is essentially certain rather than a guess.
+
+    Confirmed on two real reports: the axis had real, evenly-spaced
+    gridlines at a 0.5 step (0, 0.5, 1, 1.5...), but the "1" label sat
+    close enough beneath the auto-scaled top-of-axis label ("1.05") that
+    Tesseract couldn't read it at any --psm mode or upscale factor tried
+    (a single "1" glyph carries very little pixel information to begin
+    with) - so calibration only ever recovers 0, 0.5, and 1.05, leaving
+    _floor_to_axis_label nothing to floor a ~1.0 reading down to but 0.5,
+    even though the real "1" gridline is sitting right there on the chart,
+    unread rather than absent.
+
+    The fix doesn't try to OCR harder - it reasons from what's already
+    confirmed: these axes are evenly gridded, so the SMALLEST gap between
+    two already-RANSAC-confirmed real values is the axis's own grid step
+    (a smaller true step would mean two real gridlines closer together
+    than anything actually observed, which is a contradiction - two
+    confirmed points can't both be real and closer than the true step).
+    Every multiple of that step lying strictly between the lowest and
+    highest confirmed value is then a gridline that has to physically
+    exist on the chart whether or not its printed label survived OCR, so
+    it's added to the floor-candidate set. Nothing is ever extrapolated
+    PAST the confirmed range (that would be a real guess, not an
+    inference) - a step this fills gaps INSIDE, never projects outward
+    from. n_steps is capped as a guard against a degenerate near-zero gap
+    (e.g. two OCR reads of the same physical label a fraction of a pixel
+    apart) turning this into a very long, pointless loop; if that cap
+    trips, this returns the original values unchanged rather than a
+    partial fill.
+    """
+    vals = sorted(values)
+    if len(vals) < 2:
+        return set(vals)
+    gaps = [b - a for a, b in zip(vals, vals[1:]) if b - a > 1e-9]
+    if not gaps:
+        return set(vals)
+    step = min(gaps)
+    lo, hi = vals[0], vals[-1]
+    n_steps = int((hi - lo) / step + 1e-6)
+    if n_steps > 200:
+        return set(vals)
+    out = set(vals)
+    for i in range(n_steps + 1):
+        candidate = lo + i * step
+        if not any(abs(candidate - v) <= step * 0.1 for v in out):
+            out.add(round(candidate, 10))
+    return out
+
+
 def _floor_to_axis_label(value: float, kept_points: list[tuple[float, float]]) -> float:
     """Snap value down to the largest y-axis tick label at or below it -
     "read the peak, match it to the closest label rounded down" - rather
     than reporting a continuous interpolated number. This deliberately
     trades a little precision for staying anchored to a number that's
-    actually printed on the chart.
+    actually printed on the chart - see _infer_grid_ticks for the one
+    deliberate, narrow exception (a gridline value strictly between two
+    OCR'd labels, and therefore essentially certain to be real even
+    though Tesseract itself never read it).
     """
-    ticks = sorted({v for _, v in kept_points} | {0.0})
+    ticks = sorted(_infer_grid_ticks({v for _, v in kept_points} | {0.0}))
     floor_val = 0.0
     for t in ticks:
         if t <= value:
@@ -706,7 +841,10 @@ def read_spectrum_peak(chart_image: Image.Image) -> dict:
                             kept for debugging/inspection, not used for
                             priority thresholds
       y_axis_ticks         the (value) labels used for calibration, for
-                            sanity-checking against the actual chart
+                            sanity-checking against the actual chart - can
+                            include a value strictly between two OCR'd
+                            labels that Tesseract itself never read (see
+                            _infer_grid_ticks), not only literal OCR output
       error                None on success, else a short string saying
                             what failed (e.g. "could not OCR enough y-axis
                             tick labels to calibrate")
@@ -733,18 +871,18 @@ def read_spectrum_peak(chart_image: Image.Image) -> dict:
         max_tick_val = max(v for _, v in kept)
         left, right, top, bottom = _find_plot_frame(arr, label_right_edge, a, b, max_tick_val)
         if right <= left + 4 or bottom <= top + 4:
-            return {"peak_amplitude": None, "peak_amplitude_raw": None, "y_axis_ticks": sorted({v for _, v in kept}), "error": "plot frame border not found"}
+            return {"peak_amplitude": None, "peak_amplitude_raw": None, "y_axis_ticks": sorted(_infer_grid_ticks({v for _, v in kept})), "error": "plot frame border not found"}
 
         peak_row, _peak_col = _find_peak_pixel(arr, left, right, top, bottom)
         if peak_row is None:
-            return {"peak_amplitude": None, "peak_amplitude_raw": None, "y_axis_ticks": sorted({v for _, v in kept}), "error": "no data ink found in plot area"}
+            return {"peak_amplitude": None, "peak_amplitude_raw": None, "y_axis_ticks": sorted(_infer_grid_ticks({v for _, v in kept})), "error": "no data ink found in plot area"}
 
         raw_value = (peak_row - b) / a
         floored = _floor_to_axis_label(raw_value, kept)
         return {
             "peak_amplitude": floored,
             "peak_amplitude_raw": raw_value,
-            "y_axis_ticks": sorted({v for _, v in kept}),
+            "y_axis_ticks": sorted(_infer_grid_ticks({v for _, v in kept})),
             "error": None,
         }
     except Exception as exc:  # noqa: BLE001 - one bad image shouldn't kill a batch run
