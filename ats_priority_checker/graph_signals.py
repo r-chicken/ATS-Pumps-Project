@@ -155,27 +155,28 @@ def detect_spectrum_unit(ocr_text: str) -> str:
 # docstring's history section) rather than a reason to bring one back.
 MEASUREMENT_POINT_RE = re.compile(r"\\\s*(?P<location>[^,\n]{2,60}?)\s*,")
 
-# The physical location itself is always "{Mtr|Fan} {Shaft|End|...} {H|V|A}"
-# - Motor or Fan, which end, then a single-letter direction (Horizontal,
-# Vertical, Axial). Everything AFTER that direction letter is a unit
-# designator tacked on by the ATS software ("Mtr Shaft H IPS", "Fan Shaft H
-# gE3") - not part of the physical measurement point, and OCR-unstable in a
-# way the location words aren't (confirmed on real reports: the same real
-# sensor read "gE3" on one visit's scan and "g&3" on another's). Everything
-# BEFORE the "F"/"M" that starts "Fan"/"Mtr" is leftover cruft from the
-# capture above (there normally isn't any, but nothing guarantees that on
-# every OCR pass). This keeps only the part in between - "Mtr Shaft H",
-# "Fan End H" - which is what's actually meaningful to a reviewer, so
-# trailing OCR noise there can't quietly make "the same sensor" look like
-# two different ones on the page.
+# The physical location itself is always "{Mtr|Fan|Pump} {Shaft|End|...}
+# {H|V|A}" - Motor, Fan, or Pump, which end, then a single-letter direction
+# (Horizontal, Vertical, Axial). Everything AFTER that direction letter is a
+# unit designator tacked on by the ATS software ("Mtr Shaft H IPS", "Fan
+# Shaft H gE3", "Pump Shaft H gE3") - not part of the physical measurement
+# point, and OCR-unstable in a way the location words aren't (confirmed on
+# real reports: the same real sensor read "gE3" on one visit's scan and
+# "g&3" on another's). Everything BEFORE the "F"/"M"/"P" that starts
+# "Fan"/"Mtr"/"Pump" is leftover cruft from the capture above (there
+# normally isn't any, but nothing guarantees that on every OCR pass). This
+# keeps only the part in between - "Mtr Shaft H", "Fan End H", "Pump Shaft
+# H" - which is what's actually meaningful to a reviewer, so trailing OCR
+# noise there can't quietly make "the same sensor" look like two different
+# ones on the page.
 #
 # Deliberately case-sensitive (no re.IGNORECASE) on the anchors - "Fan"/
-# "Mtr" and the direction letter are always capitalized on real reports,
-# and matching lowercase too caused a real false start in testing: "junk
-# before Fan End V" - re.search found the "f" inside "before" first and
-# ran with it. Case-sensitive anchors can't do that; the inner descriptive
-# word(s) (Shaft/End/Bearing/...) stay case-flexible since only the two
-# ends need to be trustworthy.
+# "Mtr"/"Pump" and the direction letter are always capitalized on real
+# reports, and matching lowercase too caused a real false start in testing:
+# "junk before Fan End V" - re.search found the "f" inside "before" first
+# and ran with it. Case-sensitive anchors can't do that; the inner
+# descriptive word(s) (Shaft/End/Bearing/...) stay case-flexible since only
+# the two ends need to be trustworthy.
 #
 # The direction letter's own end isn't always a clean word boundary either
 # - confirmed on a real report, the unit suffix can end up glued directly
@@ -187,15 +188,19 @@ MEASUREMENT_POINT_RE = re.compile(r"\\\s*(?P<location>[^,\n]{2,60}?)\s*,")
 # while a genuine longer word that happened to start with H/V/A (lowercase
 # continuing right after) would fail this and correctly NOT be treated as
 # the end.
-_MEASUREMENT_POINT_CORE_RE = re.compile(r"[FM][a-z]*(?:\s+[A-Za-z]+)*?\s+[HVA](?=[^a-z]|$)")
+_MEASUREMENT_POINT_CORE_RE = re.compile(r"[FMP][a-z]*(?:\s+[A-Za-z]+)*?\s+[HVA](?=[^a-z]|$)")
 
 # Known OCR misreads worth correcting outright rather than leaving to the
 # repetition-voting below to (usually) outvote - confirmed on real reports:
 # "Mtr" -> "Mir" often enough that a single image's OCR pass can plausibly
 # get MORE than half its repeats wrong, not just the occasional one-off a
 # majority vote shrugs off. Applied before the core-trim above so a
-# corrected "Mtr" still matches the [FM] anchor. "Mitr" (extra "i") is the
+# corrected "Mtr" still matches the [FMP] anchor. "Mitr" (extra "i") is the
 # same underlying misread in the other direction - same fix, same reason.
+# No equivalent misread has been confirmed for "Pump" yet, so there's
+# nothing to add here for it - the anchor extension below is enough on its
+# own to stop "Pump ..." labels from falling through to the raw-match
+# fallback the way "Mtr"/"Fan" ones no longer do.
 _KNOWN_OCR_FIXES = [
     (re.compile(r"\bMir\b"), "Mtr"),
     (re.compile(r"\bMitr\b"), "Mtr"),
@@ -204,21 +209,22 @@ _KNOWN_OCR_FIXES = [
 
 def detect_measurement_point(ocr_text: str) -> str | None:
     """Best-effort read of the sensor location/direction label from the
-    chart's own panel titles (e.g. "Mtr Shaft H", "Fan End H") - returns
-    None if nothing matched.
+    chart's own panel titles (e.g. "Mtr Shaft H", "Fan End H", "Pump Shaft
+    H") - returns None if nothing matched.
 
     The same label is printed redundantly under all three panels
     (Spectrum, Waterfall, Trend) on every real report seen, so rather than
     trusting whichever match comes first, this takes the most common
     string across all of them (after trimming each one down to its core
-    "{Fan|Mtr} ... {H|V|A}" span first - see _MEASUREMENT_POINT_CORE_RE -
-    so noise before/after that span doesn't split votes for what's really
-    the same location across repeats within one image, not just across
-    reports) - the same "let repetition outvote a one-off OCR slip" idea
-    _read_y_axis_ticks uses for tick labels, just simpler since there's no
-    numeric fitting involved here, only picking a mode. A raw match that
-    doesn't contain a recognizable "{Fan|Mtr} ... {H|V|A}" span at all
-    falls back to itself, stripped, rather than being dropped outright -
+    "{Fan|Mtr|Pump} ... {H|V|A}" span first - see
+    _MEASUREMENT_POINT_CORE_RE - so noise before/after that span doesn't
+    split votes for what's really the same location across repeats within
+    one image, not just across reports) - the same "let repetition outvote
+    a one-off OCR slip" idea _read_y_axis_ticks uses for tick labels, just
+    simpler since there's no numeric fitting involved here, only picking a
+    mode. A raw match that doesn't contain a recognizable "{Fan|Mtr|Pump}
+    ... {H|V|A}" span at all falls back to itself, stripped, rather than
+    being dropped outright -
     better to surface an unfamiliar label than silently lose the row.
     Known OCR misreads (see _KNOWN_OCR_FIXES) are corrected explicitly
     rather than left to this voting to sort out - a real image can plausibly
