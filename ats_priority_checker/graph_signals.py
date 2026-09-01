@@ -895,55 +895,70 @@ def read_spectrum_peak(chart_image: Image.Image) -> dict:
 
 
 def velocity_priority_hint(amp: float) -> int:
-    """Velocity (in/s) peak amplitude -> priority. >1 -> 1, 0.5-1 -> 2,
-    0.14-0.5 -> 3, <0.14 -> 4.
+    """Velocity (in/s) peak amplitude -> priority, PUMP EQUIPMENT ONLY.
+    >0.575 -> 1, 0.33-0.575 -> 2, 0.105-0.33 -> 3, <0.105 -> 4.
 
-    The 3/4 boundary was refit against 799 real reports' stated priorities
-    (moved from 0.1 to 0.14 - see the conversation this is from for the
-    full derivation): with 406 Priority-4 and 35 Priority-3 reports on
-    record, 0.14 is where "predict the priority-bucket that best matches
-    what this equipment's report actually says" lands, not a guess -
-    accuracy on that data went from 76.9% to 89.5%, and Priority-3 recall
-    (catching a real Priority 3 as a 3, not letting it slip to a 4) from
-    26% (at the old, less-refined 0.3 tried in between) to 80%. The 1/2
-    boundary is untouched on purpose: the same dataset has only 2 reports
-    stated Priority 1 and 3 stated Priority 2 for this unit - nowhere near
-    enough to responsibly move a threshold away from its prior physically-
-    motivated value, so it stays put until there's more data behind it.
+    Refit specifically for this project (ATS-Pumps-Project) against 187
+    pump reports' stated priorities (priority_raw: 115 P4, 36 P3, 30 P2, 6
+    P1) - replacing a prior fit (>1 -> 1, 0.5-1 -> 2, 0.14-0.5 -> 3,
+    <0.14 -> 4) built against a 799-report set that wasn't pump-only. Kept
+    to pumps deliberately: fan equipment has different amplitude behavior
+    than pumps (per the project owner) - do not port these numbers to
+    ATS-Fans-Project or apply them to a mixed equipment set.
+
+    Method differs from the old fit too: each boundary here is the
+    midpoint between two adjacent priorities' own median amplitude, not an
+    accuracy/recall search against text_recommended_priority - this
+    sample doesn't support that kind of search the way the 799-report set
+    did, particularly for Priority 1 (only 6 reports). Bands overlap
+    substantially in the raw data (e.g. a real Priority-3 pump reading as
+    high as 0.6, well past Priority 2's own low end of 0.018) - these
+    thresholds are the most defensible single cut points given that
+    overlap, not a claim that amplitude alone cleanly separates every
+    report's stated priority.
     """
-    if amp > 1:
+    if amp > 0.575:
         return 1
-    if amp >= 0.5:
+    if amp >= 0.33:
         return 2
-    if amp >= 0.14:
+    if amp >= 0.105:
         return 3
     return 4
 
 
 def acceleration_enveloping_priority_hint(amp: float) -> int:
-    """Acceleration enveloping (gE) peak amplitude -> priority. >0.45 -> 1,
-    0.3-0.45 -> 2, 0.09-0.3 -> 3, <0.09 -> 4.
+    """Acceleration enveloping (gE) peak amplitude -> priority, PUMP
+    EQUIPMENT ONLY. >0.4 -> 1, 0.1675-0.4 -> 2, 0.0675-0.1675 -> 3,
+    <0.0675 -> 4.
 
-    Only the 1 boundary was refit (from 0.54 to 0.45), against 335 real
-    reports' stated priorities (2 obvious pixel-misread outliers at 15.0
-    gE excluded - see the conversation this is from). The old 0.54 cutoff
-    scored WORSE than just always guessing Priority 4 (33.7% accuracy vs.
-    a 41.5% do-nothing baseline) and only caught 54% of real Priority-1
-    reports; 0.45 catches 78% of them for a smaller miss rate elsewhere.
-    The 2/3/4 boundaries are deliberately NOT touched: in this same data,
-    Priority 3's median amplitude (0.14) is actually LOWER than Priority
-    4's (0.18) - they are not separated by amplitude at all, in either
-    direction, no matter where a boundary is drawn. That's a property of
-    how gE priority actually gets assigned on these reports (something
-    other than peak amplitude is deciding 3 vs. 4), not a threshold-tuning
-    problem - don't try to fix it by moving these two further without new
-    evidence that the underlying relationship has changed.
+    Refit specifically for this project (ATS-Pumps-Project) against 185
+    pump reports' stated priorities (priority_raw: 47 P4, 37 P3, 92 P2, 11
+    P1, after correcting/excluding a handful of reports the peak-reading
+    bugs fixed earlier in this file's history had corrupted) - replacing a
+    prior fit (>0.475 -> 1, 0.275-0.475 -> 2, 0.09-0.275 -> 3, <0.09 -> 4)
+    built against a 335-report set that wasn't pump-only. Kept to pumps
+    deliberately: fan equipment has different amplitude behavior than
+    pumps (per the project owner) - do not port these numbers to
+    ATS-Fans-Project or apply them to a mixed equipment set.
+
+    Notably, the median-inversion problem the old fit found (gE Priority
+    3's median amplitude sitting LOWER than Priority 4's there, meaning
+    the two weren't separated by amplitude in EITHER direction) does NOT
+    reproduce here: in this pump-only sample, P3's median (0.085) sits
+    properly above P4's (0.05), and every priority's median increases in
+    the expected order. Worth treating as a real, if circumstantial,
+    signal that pump-specific behavior differs from whatever equipment mix
+    produced the old inversion - but this fit is still a median-midpoint
+    over a smaller, overlap-heavy sample (not an accuracy/recall search
+    like the old fit was), so it isn't immune to the same kind of problem
+    resurfacing with more data. Revisit if a larger pump-only sample stops
+    agreeing with this ordering.
     """
-    if amp > 0.475:
+    if amp > 0.4:
         return 1
-    if amp >= 0.275:
+    if amp >= 0.1675:
         return 2
-    if amp >= 0.09:
+    if amp >= 0.0675:
         return 3
     return 4
 
