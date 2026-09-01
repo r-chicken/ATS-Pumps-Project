@@ -290,27 +290,49 @@ def _read_y_axis_ticks(panel: Image.Image) -> tuple[list[tuple[float, float]], f
       close enough to call reliable on its own (hence not the primary
       filter), but a clean way to prefer the real cluster on an exact
       count tie rather than leaving it to scan order.
+    - A single tick label can be missing from one psm pass entirely, or
+      have its digits garbled, while a DIFFERENT pass reads it cleanly -
+      confirmed on two real reports where Tesseract's default assumed-
+      layout mode (--psm 6, "one uniform block of text") merged/dropped a
+      label sitting close above or below another one (a "1" tick directly
+      under a "1.05" one; a "0.5" tick swallowed by a nearby callout's
+      dotted leader line), while --psm 6 misread a THIRD (a lone "0.2")
+      that --psm 6's own neighbor-relative digit model got dragged off by
+      an adjacent "92"-shaped fragment above it. --psm 11 ("sparse text,
+      no assumed layout") reads each of those correctly where 6 didn't -
+      but flips the failure the other way on a label 6 already had right
+      (misread "1.5" as "15", decimal dropped), so it's not a strict
+      upgrade to switch to on its own. Both passes run and their
+      candidates POOL into one list rather than one replacing the other -
+      safe to do because a wrong token from either pass (a stray "15", a
+      misread "99") almost never lands on the real calibration line, so
+      _ransac_calibration's existing outlier rejection (built to survive
+      exactly this kind of single bad token) discards it same as always;
+      meanwhile a label only one pass caught cleanly now has a chance to
+      make it into the kept set at all, instead of leaving a gap
+      _floor_to_axis_label has nothing to floor down to.
     """
     import pytesseract
 
     cw, ch = panel.size
     strip = panel.crop((0, 0, int(cw * Y_LABEL_STRIP_WFRAC), ch))
     strip_up = strip.resize((strip.size[0] * OCR_UPSCALE, strip.size[1] * OCR_UPSCALE), Image.LANCZOS)
-    data = pytesseract.image_to_data(
-        strip_up,
-        config="--psm 6 -c tessedit_char_whitelist=0123456789.",
-        output_type=pytesseract.Output.DICT,
-    )
 
     candidates = []
-    for i in range(len(data["text"])):
-        text = data["text"][i].strip()
-        if not text or not re.fullmatch(r"\d+\.\d+|\d+", text):
-            continue
-        row = (data["top"][i] + data["height"][i] / 2) / OCR_UPSCALE
-        right_edge = (data["left"][i] + data["width"][i]) / OCR_UPSCALE
-        conf = float(data["conf"][i])
-        candidates.append((row, float(text), right_edge, conf))
+    for psm in (6, 11):
+        data = pytesseract.image_to_data(
+            strip_up,
+            config=f"--psm {psm} -c tessedit_char_whitelist=0123456789.",
+            output_type=pytesseract.Output.DICT,
+        )
+        for i in range(len(data["text"])):
+            text = data["text"][i].strip()
+            if not text or not re.fullmatch(r"\d+\.\d+|\d+", text):
+                continue
+            row = (data["top"][i] + data["height"][i] / 2) / OCR_UPSCALE
+            right_edge = (data["left"][i] + data["width"][i]) / OCR_UPSCALE
+            conf = float(data["conf"][i])
+            candidates.append((row, float(text), right_edge, conf))
 
     if not candidates:
         return [], None
@@ -737,14 +759,68 @@ def _find_peak_pixel(arr: np.ndarray, left: int, right: int, top: int, bottom: i
     return y0 + int(resolved_topmost[best_col]), left + 2 + best_col
 
 
+def _infer_grid_ticks(values: set[float]) -> set[float]:
+    """Fill in gridline VALUES that sit strictly between two already-OCR'd
+    tick labels, when doing so is essentially certain rather than a guess.
+
+    Confirmed on two real reports: the axis had real, evenly-spaced
+    gridlines at a 0.5 step (0, 0.5, 1, 1.5...), but the "1" label sat
+    close enough beneath the auto-scaled top-of-axis label ("1.05") that
+    Tesseract couldn't read it at any --psm mode or upscale factor tried
+    (a single "1" glyph carries very little pixel information to begin
+    with) - so calibration only ever recovers 0, 0.5, and 1.05, leaving
+    _floor_to_axis_label nothing to floor a ~1.0 reading down to but 0.5,
+    even though the real "1" gridline is sitting right there on the chart,
+    unread rather than absent.
+
+    The fix doesn't try to OCR harder - it reasons from what's already
+    confirmed: these axes are evenly gridded, so the SMALLEST gap between
+    two already-RANSAC-confirmed real values is the axis's own grid step
+    (a smaller true step would mean two real gridlines closer together
+    than anything actually observed, which is a contradiction - two
+    confirmed points can't both be real and closer than the true step).
+    Every multiple of that step lying strictly between the lowest and
+    highest confirmed value is then a gridline that has to physically
+    exist on the chart whether or not its printed label survived OCR, so
+    it's added to the floor-candidate set. Nothing is ever extrapolated
+    PAST the confirmed range (that would be a real guess, not an
+    inference) - a step this fills gaps INSIDE, never projects outward
+    from. n_steps is capped as a guard against a degenerate near-zero gap
+    (e.g. two OCR reads of the same physical label a fraction of a pixel
+    apart) turning this into a very long, pointless loop; if that cap
+    trips, this returns the original values unchanged rather than a
+    partial fill.
+    """
+    vals = sorted(values)
+    if len(vals) < 2:
+        return set(vals)
+    gaps = [b - a for a, b in zip(vals, vals[1:]) if b - a > 1e-9]
+    if not gaps:
+        return set(vals)
+    step = min(gaps)
+    lo, hi = vals[0], vals[-1]
+    n_steps = int((hi - lo) / step + 1e-6)
+    if n_steps > 200:
+        return set(vals)
+    out = set(vals)
+    for i in range(n_steps + 1):
+        candidate = lo + i * step
+        if not any(abs(candidate - v) <= step * 0.1 for v in out):
+            out.add(round(candidate, 10))
+    return out
+
+
 def _floor_to_axis_label(value: float, kept_points: list[tuple[float, float]]) -> float:
     """Snap value down to the largest y-axis tick label at or below it -
     "read the peak, match it to the closest label rounded down" - rather
     than reporting a continuous interpolated number. This deliberately
     trades a little precision for staying anchored to a number that's
-    actually printed on the chart.
+    actually printed on the chart - see _infer_grid_ticks for the one
+    deliberate, narrow exception (a gridline value strictly between two
+    OCR'd labels, and therefore essentially certain to be real even
+    though Tesseract itself never read it).
     """
-    ticks = sorted({v for _, v in kept_points} | {0.0})
+    ticks = sorted(_infer_grid_ticks({v for _, v in kept_points} | {0.0}))
     floor_val = 0.0
     for t in ticks:
         if t <= value:
@@ -765,7 +841,10 @@ def read_spectrum_peak(chart_image: Image.Image) -> dict:
                             kept for debugging/inspection, not used for
                             priority thresholds
       y_axis_ticks         the (value) labels used for calibration, for
-                            sanity-checking against the actual chart
+                            sanity-checking against the actual chart - can
+                            include a value strictly between two OCR'd
+                            labels that Tesseract itself never read (see
+                            _infer_grid_ticks), not only literal OCR output
       error                None on success, else a short string saying
                             what failed (e.g. "could not OCR enough y-axis
                             tick labels to calibrate")
@@ -792,18 +871,18 @@ def read_spectrum_peak(chart_image: Image.Image) -> dict:
         max_tick_val = max(v for _, v in kept)
         left, right, top, bottom = _find_plot_frame(arr, label_right_edge, a, b, max_tick_val)
         if right <= left + 4 or bottom <= top + 4:
-            return {"peak_amplitude": None, "peak_amplitude_raw": None, "y_axis_ticks": sorted({v for _, v in kept}), "error": "plot frame border not found"}
+            return {"peak_amplitude": None, "peak_amplitude_raw": None, "y_axis_ticks": sorted(_infer_grid_ticks({v for _, v in kept})), "error": "plot frame border not found"}
 
         peak_row, _peak_col = _find_peak_pixel(arr, left, right, top, bottom)
         if peak_row is None:
-            return {"peak_amplitude": None, "peak_amplitude_raw": None, "y_axis_ticks": sorted({v for _, v in kept}), "error": "no data ink found in plot area"}
+            return {"peak_amplitude": None, "peak_amplitude_raw": None, "y_axis_ticks": sorted(_infer_grid_ticks({v for _, v in kept})), "error": "no data ink found in plot area"}
 
         raw_value = (peak_row - b) / a
         floored = _floor_to_axis_label(raw_value, kept)
         return {
             "peak_amplitude": floored,
             "peak_amplitude_raw": raw_value,
-            "y_axis_ticks": sorted({v for _, v in kept}),
+            "y_axis_ticks": sorted(_infer_grid_ticks({v for _, v in kept})),
             "error": None,
         }
     except Exception as exc:  # noqa: BLE001 - one bad image shouldn't kill a batch run
