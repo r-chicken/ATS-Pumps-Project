@@ -896,7 +896,7 @@ def read_spectrum_peak(chart_image: Image.Image) -> dict:
 
 def velocity_priority_hint(amp: float) -> int:
     """Velocity (in/s) peak amplitude -> priority, PUMP EQUIPMENT ONLY.
-    >0.575 -> 1, 0.33-0.575 -> 2, 0.105-0.33 -> 3, <0.105 -> 4.
+    >1.25 -> 1, 0.475-1.25 -> 2, 0.15-0.475 -> 3, <0.15 -> 4.
 
     Refit specifically for this project (ATS-Pumps-Project) against 187
     pump reports' stated priorities (priority_raw: 115 P4, 36 P3, 30 P2, 6
@@ -906,32 +906,35 @@ def velocity_priority_hint(amp: float) -> int:
     than pumps (per the project owner) - do not port these numbers to
     ATS-Fans-Project or apply them to a mixed equipment set.
 
-    Method differs from the old fit too: each boundary here is the
-    midpoint between two adjacent priorities' own median amplitude, not an
-    accuracy/recall search against text_recommended_priority - this
-    sample doesn't support that kind of search the way the 799-report set
-    did, particularly for Priority 1 (only 6 reports). Bands overlap
-    substantially in the raw data (e.g. a real Priority-3 pump reading as
-    high as 0.6, well past Priority 2's own low end of 0.018) - these
-    thresholds are the most defensible single cut points given that
-    overlap, not a claim that amplitude alone cleanly separates every
-    report's stated priority.
+    Chosen by grid search over every candidate boundary triple (midpoints
+    between consecutive distinct observed amplitudes, t1<t2<t3) to
+    maximize weighted-F1 against priority_raw - not the median-midpoint of
+    an earlier version of this fit, which was replaced after the project
+    owner compared both against real classification-report output and
+    explicitly chose to optimize overall accuracy. Worth knowing exactly
+    what that traded away: Priority-1 recall is 33% here (catches 2 of 6
+    real Priority-1 pumps) vs. 76% under the median-midpoint version this
+    replaced - accuracy went up, but at a real cost to catching severe
+    equipment. See acceleration_enveloping_priority_hint's docstring for
+    why that tradeoff is sharper still on gE, where it's the majority
+    Priority-2 class the search would happily sacrifice Priority-1 recall
+    for if left unconstrained.
     """
-    if amp > 0.575:
+    if amp > 1.25:
         return 1
-    if amp >= 0.33:
+    if amp >= 0.475:
         return 2
-    if amp >= 0.105:
+    if amp >= 0.15:
         return 3
     return 4
 
 
 def acceleration_enveloping_priority_hint(amp: float) -> int:
     """Acceleration enveloping (gE) peak amplitude -> priority, PUMP
-    EQUIPMENT ONLY. >0.4 -> 1, 0.1675-0.4 -> 2, 0.0675-0.1675 -> 3,
-    <0.0675 -> 4.
+    EQUIPMENT ONLY. >0.925 -> 1, 0.095-0.925 -> 2, 0.06-0.095 -> 3,
+    <0.06 -> 4.
 
-    Refit specifically for this project (ATS-Pumps-Project) against 185
+    Refit specifically for this project (ATS-Pumps-Project) against 187
     pump reports' stated priorities (priority_raw: 47 P4, 37 P3, 92 P2, 11
     P1, after correcting/excluding a handful of reports the peak-reading
     bugs fixed earlier in this file's history had corrupted) - replacing a
@@ -941,24 +944,33 @@ def acceleration_enveloping_priority_hint(amp: float) -> int:
     pumps (per the project owner) - do not port these numbers to
     ATS-Fans-Project or apply them to a mixed equipment set.
 
-    Notably, the median-inversion problem the old fit found (gE Priority
-    3's median amplitude sitting LOWER than Priority 4's there, meaning
-    the two weren't separated by amplitude in EITHER direction) does NOT
-    reproduce here: in this pump-only sample, P3's median (0.085) sits
-    properly above P4's (0.05), and every priority's median increases in
-    the expected order. Worth treating as a real, if circumstantial,
-    signal that pump-specific behavior differs from whatever equipment mix
-    produced the old inversion - but this fit is still a median-midpoint
-    over a smaller, overlap-heavy sample (not an accuracy/recall search
-    like the old fit was), so it isn't immune to the same kind of problem
-    resurfacing with more data. Revisit if a larger pump-only sample stops
-    agreeing with this ordering.
+    Same weighted-F1 grid search as velocity_priority_hint, and the same
+    tradeoff it made explicitly, chosen by the project owner over an
+    earlier median-midpoint version of this fit after comparing both
+    against real classification-report output: Priority-1 recall here is
+    45% (catches 5 of 11 real Priority-1 pumps) vs. 78% under the
+    median-midpoint version this replaced. Accuracy is materially higher,
+    but real severe pumps are missed more often as a direct result -
+    know that before leaning on this signal alone for anything safety-
+    critical.
+
+    One search wrinkle worth recording: with only 11 Priority-1 examples
+    against 92 Priority-2 ones, the RAW best-scoring P2/P1 boundary the
+    search found was amp>20 (weighted-F1 0.552) - which would make
+    Priority 1 nearly unreachable in practice (higher than every reading
+    in this sample but one 35 gE outlier), maximizing accuracy by mostly
+    giving up on classifying Priority 1 at all. amp>0.925 scores
+    statistically identically (0.551, a difference well within this
+    sample's noise) without that degenerate behavior, so it's what's
+    actually used here - if you rerun this search, don't take its raw
+    top-scoring P2/P1 boundary at face value without checking near-tied
+    runners-up the same way.
     """
-    if amp > 0.4:
+    if amp > 0.925:
         return 1
-    if amp >= 0.1675:
+    if amp >= 0.095:
         return 2
-    if amp >= 0.0675:
+    if amp >= 0.06:
         return 3
     return 4
 
