@@ -275,7 +275,21 @@ def _read_y_axis_ticks(panel: Image.Image) -> tuple[list[tuple[float, float]], f
       edge and keeps only the largest cluster - reliably keeps the real
       ticks and drops the rest, even when a couple of them have very low
       OCR confidence (confidence alone was tried and wasn't reliable
-      enough to use as the primary filter here).
+      enough to use as the primary filter here). It's used as a tie-
+      breaker between same-size clusters, though - confirmed on a real
+      report where a rotated fault-frequency callout (a "Fund Amp: ..."
+      readout and a bearing-defect label, both printed in the plot's top-
+      left corner, right where the y-axis's own top tick labels are)
+      happened to right-align within the clustering tolerance of each
+      other AND tie the real tick cluster's size, so whichever cluster's
+      tokens Tesseract happened to emit first (scan order, not anything
+      meaningful) silently won - here, the annotation cluster, leaving
+      nothing usable to calibrate against. Every real tick label seen
+      across every report tested OCRs at 88+ confidence; every spurious
+      token from rotated/decorative annotation text seen OCRs at 0 - not
+      close enough to call reliable on its own (hence not the primary
+      filter), but a clean way to prefer the real cluster on an exact
+      count tie rather than leaving it to scan order.
     """
     import pytesseract
 
@@ -295,20 +309,23 @@ def _read_y_axis_ticks(panel: Image.Image) -> tuple[list[tuple[float, float]], f
             continue
         row = (data["top"][i] + data["height"][i] / 2) / OCR_UPSCALE
         right_edge = (data["left"][i] + data["width"][i]) / OCR_UPSCALE
-        candidates.append((row, float(text), right_edge))
+        conf = float(data["conf"][i])
+        candidates.append((row, float(text), right_edge, conf))
 
     if not candidates:
         return [], None
 
     edges = np.array([c[2] for c in candidates])
-    best_center, best_count = edges[0], 0
+    confs = np.array([c[3] for c in candidates])
+    best_center, best_score = edges[0], (0, -1.0)
     for e in edges:
-        count = int(np.sum(np.abs(edges - e) <= 4))
-        if count > best_count:
-            best_count, best_center = count, e
+        mask = np.abs(edges - e) <= 4
+        score = (int(mask.sum()), float(confs[mask].sum()))
+        if score > best_score:
+            best_score, best_center = score, e
 
     points = sorted(
-        {(row, val) for row, val, edge in candidates if abs(edge - best_center) <= 4},
+        {(row, val) for row, val, edge, _conf in candidates if abs(edge - best_center) <= 4},
         key=lambda p: p[1],
     )
     return points, float(best_center)
@@ -459,20 +476,32 @@ def _find_peak_pixel(arr: np.ndarray, left: int, right: int, top: int, bottom: i
        same topmost ink row. A real spectral peak is one frequency wide,
        at most a couple of pixels - so any run of more than
        MAX_PLATEAU_WIDTH_PX columns at the same height is a block, not
-       data. Applies regardless of color - a genuine trace essentially
-       never forms a flat multi-column plateau (real spectral noise is
-       jagged), so this is safe to apply universally. A column inside a
-       detected block does NOT just get dropped, though - it gets peeled:
-       the block's own run in that column is skipped, and whatever ink
-       comes after it (below it) in that same column is looked at next,
-       same as for a tall thin mark below. This matters because a marker
-       can sit directly ON TOP of genuine data in the same column, not
-       just next to it - confirmed on a real report, a bar box + its
-       callout line hid a real peak that was over a full labeled gridline
-       taller than the peak this function used to report before that
-       column was ever looked at below the box. See MAX_PEEL_PASSES for
-       how many stacked layers one column can have peeled before giving up
-       on it.
+       data - EXCEPT a column that's already blue-dominant there
+       (_is_blue_ish, same test point 2 uses) is excluded from that count
+       and left alone entirely, not just exempted from the cap. Two real
+       reports needed this: a rotated harmonic-flag label box sitting
+       directly on top of a severe peak (the box's bottom edge touches the
+       peak's tip with no row gap, so without the exemption the peak's own
+       column reads as just more of the same plateau), and, separately, a
+       severe peak with no marker involved at all, whose own several
+       antialiased-width columns near its near-vertical rise were on their
+       own enough columns to exceed MAX_PLATEAU_WIDTH_PX. A plain "applies
+       regardless of color" version of this check (tried first) reads
+       either of those as a wide block and erases the peak along with it -
+       exactly backwards, same failure shape as the height cap in point 2
+       ignoring blue would have, and for the same reason: the taller and
+       more severe a real peak is, the more columns of its own width look
+       "flat" by this test. A column inside a detected block does NOT just
+       get dropped, though - it gets peeled: the block's own run in that
+       column is skipped, and whatever ink comes after it (below it) in
+       that same column is looked at next, same as for a tall thin mark
+       below. This matters because a marker can sit directly ON TOP of
+       genuine data in the same column, not just next to it - confirmed on
+       a real report, a bar box + its callout line hid a real peak that
+       was over a full labeled gridline taller than the peak this function
+       used to report before that column was ever looked at below the box.
+       See MAX_PEEL_PASSES for how many stacked layers one column can have
+       peeled before giving up on it.
     2. Tall thin marks that AREN'T richly-saturated blue - rotated
        marker-label text, a UI cursor/order-marker line (e.g. red, with a
        small square handle sitting right at/above the frame's top edge -
@@ -615,20 +644,50 @@ def _find_peak_pixel(arr: np.ndarray, left: int, right: int, top: int, bottom: i
             while c2 + 1 < W and topmost[c2 + 1] != H and abs(int(topmost[c2 + 1]) - int(topmost[c])) <= PLATEAU_ROW_TOL_PX:
                 c2 += 1
             if c2 - c + 1 > MAX_PLATEAU_WIDTH_PX:
-                any_wide = True
-                # Shared floor = just past the farthest this block's own
-                # (gap-merged) ink reaches, across every column in it -
-                # not just the shallowest one, so a stray deeper column
-                # doesn't leave the rest of the block only half-cleared.
-                block_end = 0
+                # A candidate plateau can accidentally rope in a genuine
+                # peak's own column(s) alongside real marker ink - not
+                # because the peak IS a marker, but because something
+                # shares its topmost row closely enough to read as the same
+                # plateau. Confirmed on two real reports: a harmonic-flag
+                # label box sitting directly on top of a severe peak (the
+                # box's bottom edge touches the peak's tip, no row gap
+                # between them), and, separately, a severe peak with no
+                # marker involved at all, whose own several antialiased-
+                # width columns near its near-vertical rise were enough
+                # columns on their own to exceed MAX_PLATEAU_WIDTH_PX.
+                # Either way the fix is the same: a column that's already
+                # blue-dominant (_is_blue_ish - the same test Stage 2 below
+                # uses to exempt a tall run from its own height cap) is
+                # real trace data, not marker ink, so it's excluded here
+                # too - both from the count that decides whether this is
+                # actually a wide block, and from the shared floor push,
+                # so its own ink is left completely alone for Stage 2 to
+                # read normally. Without this, the shared floor (next
+                # paragraph) gets computed from - and then applied to - a
+                # peak that was never part of the marker to begin with,
+                # which silently erases it.
+                marker_cols = []
                 for cc in range(c, c2 + 1):
                     idx = np.where(ink[:, cc])[0]
                     idx = idx[idx >= floor[cc]]
                     if len(idx) == 0:
                         continue
-                    block_end = max(block_end, int(_first_run(idx, cc)[-1]))
-                for cc in range(c, c2 + 1):
-                    floor[cc] = block_end + 1
+                    fr = _first_run(idx, cc)
+                    if _is_blue_ish(region[fr, cc]).mean() >= BLUE_ISH_MIN_FRAC:
+                        continue
+                    marker_cols.append((cc, int(fr[-1])))
+
+                if len(marker_cols) > MAX_PLATEAU_WIDTH_PX:
+                    any_wide = True
+                    # Shared floor = just past the farthest this block's own
+                    # (gap-merged) ink reaches, across every marker column in
+                    # it - not just the shallowest one, so a stray deeper
+                    # column doesn't leave the rest of the block only half-
+                    # cleared. Blue-dominant columns (excluded above) never
+                    # contribute to this, and never get it applied to them.
+                    block_end = max(end for _, end in marker_cols)
+                    for cc, _end in marker_cols:
+                        floor[cc] = block_end + 1
             c = c2 + 1
         if not any_wide:
             break
