@@ -932,107 +932,45 @@ def velocity_priority_hint(amp: float) -> int:
     return 4
 
 
-def _gE_location(measurement_point: str | None) -> str | None:
-    """Classify a measurement_point label (see detect_measurement_point)
-    as "Mtr" or "Pump" for acceleration_enveloping_priority_hint's
-    location split - or None if it's neither (missing, or a location word
-    this project hasn't seen on a gE reading) - see that function's
-    docstring for why location isn't guessed at when it isn't known.
-    """
-    if not measurement_point:
-        return None
-    if measurement_point.startswith("Mtr"):
-        return "Mtr"
-    if measurement_point.startswith("Pump"):
-        return "Pump"
-    return None
-
-
-def _acceleration_enveloping_priority_hint_motor(amp: float) -> int:
-    """Mtr-location half of acceleration_enveloping_priority_hint's gE
-    split - see that function's docstring for the finding and the fit.
-    >1.28 -> 1, 0.254-1.28 -> 2, 0.15-0.254 -> 3, <0.15 -> 4.
-    """
-    if amp > 1.28:
-        return 1
-    if amp >= 0.254:
-        return 2
-    if amp >= 0.15:
-        return 3
-    return 4
-
-
-def _acceleration_enveloping_priority_hint_pump(amp: float) -> int:
-    """Pump-location half of acceleration_enveloping_priority_hint's gE
-    split - see that function's docstring for the finding and the fit,
-    and especially for the P2/P1 boundary's caveat (0.9 here is NOT a
-    fitted value - there were zero eyeballed Pump-location Priority-1 gE
-    reports to fit it against). >0.9 -> 1, 0.183-0.9 -> 2, 0.02-0.183 -> 3,
-    <0.02 -> 4.
-    """
-    if amp > 0.9:
-        return 1
-    if amp >= 0.183:
-        return 2
-    if amp >= 0.02:
-        return 3
-    return 4
-
-
-def acceleration_enveloping_priority_hint(amp: float, location: str | None) -> int | None:
+def acceleration_enveloping_priority_hint(amp: float) -> int:
     """Acceleration enveloping (gE) peak amplitude -> priority, PUMP
-    EQUIPMENT ONLY - split by WHERE on the machine the reading was taken
-    (location: "Mtr", "Pump", or None - see _gE_location), not one
-    threshold set for the whole unit anymore. Returns None if location is
-    neither "Mtr" nor "Pump" (unknown measurement point, or the reading
-    genuinely doesn't apply) - see below for why this doesn't fall back to
-    a combined threshold instead of just admitting it doesn't know.
+    EQUIPMENT ONLY. >1.28 -> 1, 0.179-1.28 -> 2, 0.048-0.179 -> 3,
+    <0.048 -> 4.
 
-    Confirmed directly on this project's own hand-eyeballed gE readings,
-    controlling for stated priority so it isn't just "Mtr equipment
-    happens to run more severe": Motor-location gE reads 2-5x HIGHER than
-    Pump-location gE at the SAME stated priority (medians - P4: 0.117 vs
-    0.025; P3: 0.236 vs 0.051; P2: 0.346 vs 0.159). A motor bearing and a
-    pump bearing are different components with different baseline
-    vibration floors, so "0.3 gE" doesn't mean the same thing at each -
-    one shared threshold was quietly averaging over two different
-    populations. (Velocity, in/s, does NOT show this split - Mtr and Pump
-    in/s land in the same range at every priority level - so
-    velocity_priority_hint is untouched.)
-
-    Splitting measurably helps: re-scored across both locations together,
-    weighted accuracy goes from 54% (single gE threshold) to 58% (location-
-    aware), with Priority-4 recall alone jumping from 44% to 68% and
-    Priority-3 recall from 44% to 60%. Each half refit with the same
-    weighted-F1 grid search as velocity_priority_hint, against the same
-    hand-eyeballed data split by location: Mtr (n=83: 17 P4, 12 P3, 43 P2,
-    11 P1) and Pump (n=39: 8 P4, 13 P3, 18 P2, 0 P1).
-
-    That last zero matters: there are no eyeballed Pump-location
-    Priority-1 gE reports AT ALL in this project yet (one exists in the
-    full 383-report set, but only as an unverified pixel-read amplitude,
-    not eyeballed) - so _acceleration_enveloping_priority_hint_pump's
-    P2/P1 boundary (0.9) is NOT a fit, it's extrapolated from the Mtr/Pump
-    ratio pattern seen at the other three priorities plus that one weak
-    data point. Revisit it specifically once real eyeballed Pump
-    Priority-1 gE reports exist - don't trust it the way the other five
-    boundaries here can be trusted.
-
-    Why an unrecognized location returns None instead of falling back to
-    a combined threshold: given the 2-5x gap above, guessing wrong here is
-    worse than saying nothing - a Pump reading wrongly run through the Mtr
-    thresholds reads as far LESS severe than it is (Mtr's higher baseline
-    would swallow a real Pump-severe reading into a "fine" bucket).
+    Refit against the project owner's own hand-eyeballed amplitude
+    readings (a "peak amplitude (eyeball)" column, read directly off each
+    chart by a person - not this file's pixel-read
+    spectrum_peak_amplitude) for 122 pump reports (priority_raw: 25 P4, 25
+    P3, 61 P2, 11 P1), superseding an earlier fit against the pixel-read
+    amplitude on a larger (187-report) but noisier sample. Same
+    weighted-F1 grid search as velocity_priority_hint. Resulting accuracy:
+    54% (n=122), lower than the prior pixel-read fit's 58% but with better-
+    balanced recall across classes (Priority-1 recall 55%, 6 of 11, vs.
+    45% before) - the search here didn't hit the earlier fit's "P2/P1 near
+    20" degenerate-boundary problem (checked the top several candidates
+    directly; nothing near that shape showed up this time).
 
     Kept to pumps deliberately: fan equipment has different amplitude
     behavior than pumps (per the project owner) - do not port these
-    numbers, or the location split itself, to ATS-Fans-Project.
+    numbers to ATS-Fans-Project or apply them to a mixed equipment set.
+
+    Hand-eyeballing the amplitudes did NOT resolve the underlying overlap
+    between priorities - confirmed directly on this data: "Trailer Dump
+    Hyd Pump" was stated Priority 4 (good) at a hand-verified 0.626 gE, a
+    reading higher than the median Priority 1 or 2 report in this same
+    sample. Per the project owner, this reflects real inconsistency in how
+    priority gets assigned to pump reports, not a reading-quality problem
+    - so treat 54% as close to the practical ceiling for a single-
+    amplitude threshold rule here, not a number a better fit would
+    meaningfully beat.
     """
-    if location == "Mtr":
-        return _acceleration_enveloping_priority_hint_motor(amp)
-    if location == "Pump":
-        return _acceleration_enveloping_priority_hint_pump(amp)
-    return None
+    if amp > 1.28:
+        return 1
+    if amp >= 0.179:
+        return 2
+    if amp >= 0.048:
+        return 3
+    return 4
 
 
 def acceleration_priority_hint(amp: float) -> int:
@@ -1048,11 +986,9 @@ def acceleration_priority_hint(amp: float) -> int:
     return 4
 
 
-# gE isn't in here on purpose - it takes a location argument the other two
-# don't (see acceleration_enveloping_priority_hint), so spectrum_priority_hint
-# special-cases it below instead of dispatching through this single-arg map.
 _UNIT_HINT_FNS = {
     "in/s": velocity_priority_hint,
+    "gE": acceleration_enveloping_priority_hint,
     "g": acceleration_priority_hint,
 }
 
@@ -1067,14 +1003,8 @@ def spectrum_priority_hint(chart_image: Image.Image, ocr_text: str) -> dict:
     unit = detect_spectrum_unit(ocr_text)
     peak = read_spectrum_peak(chart_image)
     amp = peak["peak_amplitude"]
-    if amp is None:
-        priority_hint = None
-    elif unit == "gE":
-        location = _gE_location(detect_measurement_point(ocr_text))
-        priority_hint = acceleration_enveloping_priority_hint(amp, location)
-    else:
-        hint_fn = _UNIT_HINT_FNS.get(unit)
-        priority_hint = hint_fn(amp) if hint_fn is not None else None
+    hint_fn = _UNIT_HINT_FNS.get(unit)
+    priority_hint = hint_fn(amp) if (hint_fn is not None and amp is not None) else None
     return {
         "spectrum_unit": unit,
         "spectrum_peak_amplitude": amp,
