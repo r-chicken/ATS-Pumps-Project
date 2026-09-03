@@ -147,7 +147,7 @@ def build_dataset(
                     "spectrum_unit": None,
                     "measurement_point": None,
                     "spectrum_peak_amplitude": None,
-                    "spectrum_peak_amplitude_raw": None,
+                    "spectrum_peak_amplitude_floored": None,
                     "spectrum_priority_hint": None,
                     "spectrum_peak_error": None,
                     "chart_ocr_text": None,
