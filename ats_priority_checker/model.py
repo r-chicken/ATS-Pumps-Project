@@ -244,10 +244,24 @@ def priority_signal_reports(df: pd.DataFrame, true_col: str = "true_priority") -
     informative about how often it actually has something to say, not just
     how accurate it is when it does.
 
-    Returns {signal_name: {"n": int, "report_text": str, "report_dict": dict}}
-    for whichever of the two columns are present in df; a report_dict
-    entry is None if all class-metric arrays end up empty (currently only
-    ever thrown by sklearn on genuinely undefined input, e.g. n=0).
+    Returns {signal_name: {"n": int, "true_col": str, "report_text": str,
+    "report_dict": dict}} for whichever of the two columns are present in
+    df; a report_dict entry is None if all class-metric arrays end up
+    empty (currently only ever thrown by sklearn on genuinely undefined
+    input, e.g. n=0).
+
+    report_text always leads with a "Ground truth: {true_col}" header
+    line, and true_col is also returned as its own key alongside n -
+    added after a real mix-up: two classification_report printouts
+    (predicted_priority and spectrum_priority_hint) looked directly
+    comparable, one call had been made with true_col="true_priority"
+    (hand-corrected) and the other, from an earlier snapshot, effectively
+    against priority_raw - same-shaped output, silently different ground
+    truth, and nothing in the printed report itself said so. Comparing
+    across runs (before/after a fix, old snapshot/new) is exactly when
+    this matters most, so the header travels with the report text itself
+    rather than living only in a caller's memory of which true_col they
+    passed.
     """
     from sklearn.metrics import classification_report
 
@@ -257,12 +271,19 @@ def priority_signal_reports(df: pd.DataFrame, true_col: str = "true_priority") -
         if col not in df.columns:
             continue
         sub = df.dropna(subset=[col, true_col])
+        header = f"Ground truth: {true_col}\n"
         if len(sub) == 0:
-            results[col] = {"n": 0, "report_text": "(no rows with both a value and a ground-truth priority)", "report_dict": None}
+            results[col] = {
+                "n": 0,
+                "true_col": true_col,
+                "report_text": header + "(no rows with both a value and a ground-truth priority)",
+                "report_dict": None,
+            }
             continue
         results[col] = {
             "n": len(sub),
-            "report_text": classification_report(sub[true_col], sub[col], zero_division=0),
+            "true_col": true_col,
+            "report_text": header + classification_report(sub[true_col], sub[col], zero_division=0),
             "report_dict": classification_report(sub[true_col], sub[col], zero_division=0, output_dict=True),
         }
     return results
