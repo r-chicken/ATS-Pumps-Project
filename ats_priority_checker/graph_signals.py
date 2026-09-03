@@ -834,20 +834,44 @@ def read_spectrum_peak(chart_image: Image.Image) -> dict:
     """Read the Spectrum plot's tallest genuine peak off its own y-axis.
 
     Returns a dict with:
-      peak_amplitude       the peak, floored to the nearest y-axis label
-                            at or below it (float), or None if calibration
-                            or peak-finding failed
-      peak_amplitude_raw   the same reading before flooring (float or None) -
-                            kept for debugging/inspection, not used for
-                            priority thresholds
-      y_axis_ticks         the (value) labels used for calibration, for
-                            sanity-checking against the actual chart - can
-                            include a value strictly between two OCR'd
-                            labels that Tesseract itself never read (see
-                            _infer_grid_ticks), not only literal OCR output
-      error                None on success, else a short string saying
-                            what failed (e.g. "could not OCR enough y-axis
-                            tick labels to calibrate")
+      peak_amplitude         the peak's value (float, or None if
+                              calibration or peak-finding failed) - a
+                              continuous estimate from linearly
+                              interpolating the peak's pixel row against
+                              the calibrated y-axis (see below), NOT
+                              snapped to the nearest printed gridline
+      peak_amplitude_floored the same reading snapped down to the nearest
+                              y-axis label at or below it (float or None) -
+                              kept for cross-checking against a printed
+                              number on the chart by eye; not used for
+                              priority thresholds
+      y_axis_ticks            the (value) labels used for calibration, for
+                              sanity-checking against the actual chart - can
+                              include a value strictly between two OCR'd
+                              labels that Tesseract itself never read (see
+                              _infer_grid_ticks), not only literal OCR output
+      error                 None on success, else a short string saying
+                             what failed (e.g. "could not OCR enough y-axis
+                             tick labels to calibrate")
+
+    peak_amplitude used to be the floored reading, on the reasoning that
+    trading precision for staying anchored to a number actually printed on
+    the chart was worth it. Changed after a direct real-report comparison
+    (report_153: floored to 1.0, interpolated to 1.21, a person reading
+    the same chart by eye also independently said "about 1.2") - flooring
+    can only ever revise a reading DOWN, never up, so across many reports
+    it's a systematic downward bias on severity, not neutral rounding.
+    It also turned out to be quietly inconsistent with how this project's
+    own priority thresholds are fit: velocity_priority_hint and
+    acceleration_enveloping_priority_hint are refit against hand-eyeballed
+    chart readings (see their docstrings) - a person reading "about 1.2"
+    off a chart was never flooring to the nearest printed gridline either,
+    so scoring the automated reading against thresholds fit to that kind
+    of number, while itself floored, was comparing two different things.
+    _floor_to_axis_label / peak_amplitude_floored are kept, not deleted -
+    still useful for manually cross-checking a specific reading against
+    the chart's own printed numbers - just no longer what feeds
+    spectrum_priority_hint or gets used as priority thresholds are fit.
 
     Never raises - any failure (OCR found <2 usable tick labels, frame
     border not found, empty plot area, ...) comes back as
@@ -860,33 +884,33 @@ def read_spectrum_peak(chart_image: Image.Image) -> dict:
         panel = _crop_spectrum_panel(chart_image)
         points, label_right_edge = _read_y_axis_ticks(panel)
         if label_right_edge is None:
-            return {"peak_amplitude": None, "peak_amplitude_raw": None, "y_axis_ticks": [], "error": "no y-axis tick labels OCR'd"}
+            return {"peak_amplitude": None, "peak_amplitude_floored": None, "y_axis_ticks": [], "error": "no y-axis tick labels OCR'd"}
 
         calibration = _ransac_calibration(points)
         if calibration is None:
-            return {"peak_amplitude": None, "peak_amplitude_raw": None, "y_axis_ticks": [], "error": "could not calibrate y-axis (fewer than 2 consistent tick labels)"}
+            return {"peak_amplitude": None, "peak_amplitude_floored": None, "y_axis_ticks": [], "error": "could not calibrate y-axis (fewer than 2 consistent tick labels)"}
         a, b, kept = calibration
 
         arr = np.asarray(panel.convert("RGB")).astype(int)
         max_tick_val = max(v for _, v in kept)
         left, right, top, bottom = _find_plot_frame(arr, label_right_edge, a, b, max_tick_val)
         if right <= left + 4 or bottom <= top + 4:
-            return {"peak_amplitude": None, "peak_amplitude_raw": None, "y_axis_ticks": sorted(_infer_grid_ticks({v for _, v in kept})), "error": "plot frame border not found"}
+            return {"peak_amplitude": None, "peak_amplitude_floored": None, "y_axis_ticks": sorted(_infer_grid_ticks({v for _, v in kept})), "error": "plot frame border not found"}
 
         peak_row, _peak_col = _find_peak_pixel(arr, left, right, top, bottom)
         if peak_row is None:
-            return {"peak_amplitude": None, "peak_amplitude_raw": None, "y_axis_ticks": sorted(_infer_grid_ticks({v for _, v in kept})), "error": "no data ink found in plot area"}
+            return {"peak_amplitude": None, "peak_amplitude_floored": None, "y_axis_ticks": sorted(_infer_grid_ticks({v for _, v in kept})), "error": "no data ink found in plot area"}
 
         raw_value = (peak_row - b) / a
         floored = _floor_to_axis_label(raw_value, kept)
         return {
-            "peak_amplitude": floored,
-            "peak_amplitude_raw": raw_value,
+            "peak_amplitude": round(raw_value, 4),
+            "peak_amplitude_floored": floored,
             "y_axis_ticks": sorted(_infer_grid_ticks({v for _, v in kept})),
             "error": None,
         }
     except Exception as exc:  # noqa: BLE001 - one bad image shouldn't kill a batch run
-        return {"peak_amplitude": None, "peak_amplitude_raw": None, "y_axis_ticks": [], "error": f"unexpected error: {exc}"}
+        return {"peak_amplitude": None, "peak_amplitude_floored": None, "y_axis_ticks": [], "error": f"unexpected error: {exc}"}
 
 
 # --- Priority thresholds per unit ---------------------------------------
@@ -1008,7 +1032,7 @@ def spectrum_priority_hint(chart_image: Image.Image, ocr_text: str) -> dict:
     return {
         "spectrum_unit": unit,
         "spectrum_peak_amplitude": amp,
-        "spectrum_peak_amplitude_raw": peak["peak_amplitude_raw"],
+        "spectrum_peak_amplitude_floored": peak["peak_amplitude_floored"],
         "spectrum_priority_hint": priority_hint,
         "spectrum_peak_error": peak["error"],
     }

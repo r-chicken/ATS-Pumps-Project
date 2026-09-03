@@ -64,8 +64,8 @@ class ReportRecord:
     style: str  # "waterfall" | "colored_spectrum" | "unknown"
     spectrum_unit: str | None  # "in/s" | "g" | "gE" | "unknown" | None (no chart image)
     measurement_point: str | None  # sensor location/direction label off the chart title, e.g. "Mtr Shaft H IPS" - see graph_signals.detect_measurement_point
-    spectrum_peak_amplitude: float | None  # tallest real Spectrum peak, floored to the nearest y-axis label - see graph_signals.py
-    spectrum_peak_amplitude_raw: float | None  # same reading before flooring, for debugging only
+    spectrum_peak_amplitude: float | None  # tallest real Spectrum peak, linearly interpolated between the two nearest y-axis gridlines - see graph_signals.py
+    spectrum_peak_amplitude_floored: float | None  # same reading floored down to the nearest printed y-axis label - kept for cross-checking against the chart's own tick text, not used for priority classification anymore
     spectrum_priority_hint: int | None  # supporting evidence only - see graph_signals.py
     spectrum_peak_error: str | None  # why peak-reading failed, if it did - see graph_signals.read_spectrum_peak
     chart_ocr_text: str | None  # cached raw OCR of the chart image - see dataset.recompute_dataset
@@ -265,7 +265,7 @@ def process_pdf(
                 spectrum_unit = None
                 measurement_point = None
                 spectrum_peak_amplitude = None
-                spectrum_peak_amplitude_raw = None
+                spectrum_peak_amplitude_floored = None
                 spectrum_priority_hint_val = None
                 spectrum_peak_error = None
             else:
@@ -276,7 +276,7 @@ def process_pdf(
                     hint = spectrum_priority_hint(chart_img, ocr_text)
                     spectrum_unit = hint["spectrum_unit"]
                     spectrum_peak_amplitude = hint["spectrum_peak_amplitude"]
-                    spectrum_peak_amplitude_raw = hint["spectrum_peak_amplitude_raw"]
+                    spectrum_peak_amplitude_floored = hint["spectrum_peak_amplitude_floored"]
                     spectrum_priority_hint_val = hint["spectrum_priority_hint"]
                     spectrum_peak_error = hint["spectrum_peak_error"]
                 except Exception as exc:  # noqa: BLE001 - e.g. tesseract binary missing
@@ -284,7 +284,7 @@ def process_pdf(
                     spectrum_unit = None
                     measurement_point = None
                     spectrum_peak_amplitude = None
-                    spectrum_peak_amplitude_raw = None
+                    spectrum_peak_amplitude_floored = None
                     spectrum_priority_hint_val = None
                     spectrum_peak_error = str(exc)
                     fields["parse_notes"] = (fields["parse_notes"] + f"; OCR failed: {exc}").strip("; ")
@@ -305,7 +305,7 @@ def process_pdf(
                     spectrum_unit=spectrum_unit,
                     measurement_point=measurement_point,
                     spectrum_peak_amplitude=spectrum_peak_amplitude,
-                    spectrum_peak_amplitude_raw=spectrum_peak_amplitude_raw,
+                    spectrum_peak_amplitude_floored=spectrum_peak_amplitude_floored,
                     spectrum_priority_hint=spectrum_priority_hint_val,
                     spectrum_peak_error=spectrum_peak_error,
                     chart_ocr_text=ocr_text,
