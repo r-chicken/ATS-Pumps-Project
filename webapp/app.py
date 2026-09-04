@@ -87,7 +87,10 @@ def _score_pdfs(paths: list[Path]) -> pd.DataFrame:
 
     texts = usable.apply(report_text, axis=1).tolist()
     embeddings = state["embedder"].encode(texts, normalize_embeddings=True)
-    usable["predicted_priority"] = state["clf"].predict(embeddings)
+    # clf is a TwoStagePriorityClassifier now, not a bare LogisticRegression -
+    # its stage-1 rule needs the raw recommendations text alongside the
+    # embeddings, not embeddings alone. See model.py's is_monitor_only.
+    usable["predicted_priority"] = state["clf"].predict(usable["recommendations"], embeddings)
 
     table = priority_recommendation_table(usable)
     # Carry through parse_notes for any pages that failed to parse a
