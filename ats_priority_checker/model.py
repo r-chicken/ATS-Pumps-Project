@@ -7,19 +7,6 @@ classifier on top to predict "what priority does this text imply". A
 report is flagged when the stated priority disagrees with what the text
 implies.
 
-The classifier is two-stage, not one flat 4-way model - see
-is_monitor_only()'s and TwoStagePriorityClassifier's docstrings for the
-full reasoning. Short version: recommendations == "Continue vibration
-monitoring." is a 100%, both-directions predictor of the lowest-urgency
-priority (confirmed against 417 hand-checked reports across this
-project and its two siblings, ATS-Pumps-Project and ATS-Fans-Project,
-zero exceptions), so a plain string check resolves that boundary
-perfectly and for free - the single 4-way classifier this replaced was
-already effectively re-deriving that same boundary on its own (96.9%
-agreement) while getting only 56.8% right on the genuinely hard part
-(1 vs. 2 vs. 3). Splitting it out lets the learned half specialize on
-the boundary that actually needs it.
-
 This design is meant to scale with more data later: same pipeline, same
 saved artifacts format, just re-run train_priority_classifier on a bigger
 dataset.csv as more labeled/parsed reports come in.
@@ -52,13 +39,6 @@ from sklearn.model_selection import StratifiedKFold, cross_val_predict
 
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 
-# Recommendations text that means "nothing to do, keep watching it" - see
-# is_monitor_only()'s docstring for the validation behind treating this as
-# a deterministic rule rather than something left for the embedding
-# classifier to (re-)discover on its own.
-MONITOR_ONLY_RECOMMENDATION = "Continue vibration monitoring."
-MONITOR_ONLY_PRIORITY = 4
-
 
 def report_text(row: pd.Series) -> str:
     """Combine recommendations + comments into the text the model sees."""
@@ -74,193 +54,34 @@ def embed_texts(texts: list[str], model_name: str = EMBEDDING_MODEL_NAME) -> np.
     return model.encode(list(texts), show_progress_bar=True, normalize_embeddings=True)
 
 
-def is_monitor_only(recommendations: str | None) -> bool:
-    """True when `recommendations` is EXACTLY the boilerplate "nothing to
-    do" action item - an equality check on the stripped string, not a
-    substring search, so "Continue vibration monitoring. | Inspect for
-    structural looseness." (a second real action item attached) does NOT
-    count, even though it contains the phrase; that combination was never
-    observed at MONITOR_ONLY_PRIORITY in the data this rule is based on.
-
-    This is a business rule confirmed directly against real data, not a
-    guess: checked across 417 hand-checked reports spanning this project
-    and its two siblings (ATS-Pumps-Project, ATS-Fans-Project),
-    recommendations == MONITOR_ONLY_RECOMMENDATION and priority_raw ==
-    MONITOR_ONLY_PRIORITY implied each other with ZERO exceptions in
-    either direction - all 225 reports with this exact recommendations
-    text were priority 4, and all reports stated as priority 4 used this
-    exact text and no other phrasing. See TwoStagePriorityClassifier's
-    docstring for why this is worth splitting out of the learned
-    classifier rather than trusting it to keep approximating the same
-    boundary (it was already getting there 96.9% of the time on its own -
-    close, but this rule makes that boundary exact and free).
-
-    IMPORTANT - this is a rule about priority_raw (what the report
-    ITSELF states), not about true_priority (your hand-corrected ground
-    truth), and the two are NOT interchangeable here. On one hand-labeled
-    set, true_priority disagreed with priority_raw on 22 of 313
-    monitor-only reports - real "text reads mild, actual severity is
-    higher" mismatches, exactly what this whole system exists to catch.
-    Locking predicted_priority to MONITOR_ONLY_PRIORITY whenever this
-    rule fires means the TEXT signal can never flag any of those 22 -
-    checked, and confirmed this doesn't open a new gap: the SPECTRUM
-    signal (spectrum_priority_hint) already independently catches all 22
-    of them (spectrum_disagrees fires on every one). That's not a
-    coincidence to rely on blindly going forward - it held because these
-    22 corrections were driven by the chart amplitude, not by anything
-    unusual in the wording (comments for these read just as mild as any
-    genuine priority-4 report; see graph_signals.py's module docstring on
-    why text has no way to catch this class of error at all, with or
-    without this rule). flag_mismatches' OR of text_disagrees and
-    spectrum_disagrees is precisely the design that covers this split of
-    labor - don't remove or weaken the spectrum half while this rule is
-    in place, and if a future batch of corrections turns out to be driven
-    by comment wording instead of amplitude, re-examine this rule against
-    that batch specifically before assuming it still holds.
+def cross_validated_predictions(X: np.ndarray, y: np.ndarray, n_splits: int = 5) -> dict:
+    """Out-of-fold predictions: for every row, the predicted priority comes
+    from a model that never saw that row during training. This is what you
+    want when flagging mismatches on your existing labeled reports - using
+    a model's in-sample predictions on its own training data would make
+    the stated priority look "confirmed" more often than it should.
     """
-    if not recommendations:
-        return False
-    return recommendations.strip() == MONITOR_ONLY_RECOMMENDATION
+    class_counts = pd.Series(y).value_counts()
+    n_splits = min(n_splits, int(class_counts.min())) if len(class_counts) > 0 else n_splits
+    n_splits = max(n_splits, 2)
 
-
-class TwoStagePriorityClassifier:
-    """predicted_priority in two stages:
-      1. is_monitor_only(recommendations) -> MONITOR_ONLY_PRIORITY. No
-         model involved - see that function's docstring for the 417-report
-         validation behind treating it as a hard rule.
-      2. otherwise, `stage2` (a plain LogisticRegression, fit ONLY on rows
-         stage 1 doesn't already resolve) on the report's text embedding.
-
-    Bundled as one object specifically so callers keep making one
-    `.predict(...)` call - save_bundle/load_bundle and webapp/app.py's
-    scoring path don't need to know two stages are involved at all. The
-    one visible difference from the single-LogisticRegression version
-    this replaced: `.predict`/`.predict_proba` now take `recommendations`
-    (the raw text, needed for the stage-1 rule) alongside the embeddings,
-    not embeddings alone.
-
-    stage2 never sees MONITOR_ONLY_PRIORITY as a training label at all -
-    it's fit only on the rows the monitor-only rule doesn't cover - so its
-    own .classes_ reflects only the classes that occur outside that rule
-    (1/2/3 in every project checked so far). full_classes_ is stage2's
-    classes plus MONITOR_ONLY_PRIORITY, sorted: what this object can ever
-    predict, and the fixed column order predict_proba uses.
-    """
-
-    def __init__(self, stage2: LogisticRegression):
-        self.stage2 = stage2
-
-    @property
-    def full_classes_(self) -> np.ndarray:
-        return np.union1d(self.stage2.classes_, [MONITOR_ONLY_PRIORITY])
-
-    def predict(self, recommendations, X) -> np.ndarray:
-        recs = pd.Series(list(recommendations)).reset_index(drop=True)
-        X = np.asarray(X)
-        mask = recs.apply(is_monitor_only).to_numpy()
-        out = np.empty(len(recs), dtype=self.full_classes_.dtype)
-        out[mask] = MONITOR_ONLY_PRIORITY
-        if (~mask).any():
-            out[~mask] = self.stage2.predict(X[~mask])
-        return out
-
-    def predict_proba(self, recommendations, X) -> np.ndarray:
-        """Columns are always ordered per full_classes_ - unlike a plain
-        sklearn estimator, whose predict_proba column order comes from
-        whatever classes its OWN training fold happened to contain. That
-        matters here because stage2 alone never has MONITOR_ONLY_PRIORITY
-        in its classes at all, so without this a caller could never find
-        that column by position."""
-        recs = pd.Series(list(recommendations)).reset_index(drop=True)
-        X = np.asarray(X)
-        classes = self.full_classes_
-        class_to_idx = {c: i for i, c in enumerate(classes)}
-        mask = recs.apply(is_monitor_only).to_numpy()
-        proba = np.zeros((len(recs), len(classes)))
-        proba[mask, class_to_idx[MONITOR_ONLY_PRIORITY]] = 1.0
-        if (~mask).any():
-            stage2_proba = self.stage2.predict_proba(X[~mask])
-            cols = [class_to_idx[c] for c in self.stage2.classes_]
-            rows = np.where(~mask)[0]
-            sub = proba[rows]
-            sub[:, cols] = stage2_proba
-            proba[rows] = sub
-        return proba
-
-
-def cross_validated_predictions(recommendations, X: np.ndarray, y: np.ndarray, n_splits: int = 5) -> dict:
-    """Out-of-fold predictions, two stages - see is_monitor_only's and
-    TwoStagePriorityClassifier's docstrings for what the stages are and
-    why this is split this way. Stage 1 is a deterministic string
-    comparison, not fit from data, so it has nothing to leak and needs no
-    cross-validation of its own. Stage 2 is cross-validated exactly as
-    the old single-stage version was - out-of-fold, so a report's own
-    prediction never came from a fold that trained on it - just over the
-    narrower set of rows stage 1 doesn't already resolve.
-
-    Returns the same shape as before - {"pred", "proba", "classes",
-    "n_splits"} - plus "stage1_mask" (bool array, True where the
-    monitor-only rule fired), so a caller that wants to know which stage
-    produced which prediction doesn't have to re-derive it. "classes" is
-    TwoStagePriorityClassifier.full_classes_ - MONITOR_ONLY_PRIORITY is
-    always included even if, on this particular data, the rule never
-    fires, so column position in "proba" stays stable across calls.
-    """
-    recommendations = pd.Series(list(recommendations)).reset_index(drop=True)
-    X = np.asarray(X)
-    y = np.asarray(y)
-    stage1_mask = recommendations.apply(is_monitor_only).to_numpy()
-    stage2_idx = np.where(~stage1_mask)[0]
-
-    class_counts = pd.Series(y[stage2_idx]).value_counts()
-    stage2_splits = min(n_splits, int(class_counts.min())) if len(class_counts) > 0 else n_splits
-    stage2_splits = max(stage2_splits, 2)
-
-    skf = StratifiedKFold(n_splits=stage2_splits, shuffle=True, random_state=0)
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=0)
     clf = LogisticRegression(max_iter=2000, class_weight="balanced")
 
-    stage2_pred = cross_val_predict(clf, X[stage2_idx], y[stage2_idx], cv=skf, method="predict")
-    stage2_proba = cross_val_predict(clf, X[stage2_idx], y[stage2_idx], cv=skf, method="predict_proba")
-    stage2_classes = np.unique(y[stage2_idx])
+    pred = cross_val_predict(clf, X, y, cv=skf, method="predict")
+    proba = cross_val_predict(clf, X, y, cv=skf, method="predict_proba")
+    classes = np.unique(y)
 
-    classes = np.union1d(stage2_classes, [MONITOR_ONLY_PRIORITY])
-    class_to_idx = {c: i for i, c in enumerate(classes)}
-
-    pred = np.empty(len(y), dtype=classes.dtype)
-    pred[stage1_mask] = MONITOR_ONLY_PRIORITY
-    pred[stage2_idx] = stage2_pred
-
-    proba = np.zeros((len(y), len(classes)))
-    proba[stage1_mask, class_to_idx[MONITOR_ONLY_PRIORITY]] = 1.0
-    cols = [class_to_idx[c] for c in stage2_classes]
-    sub = proba[stage2_idx]
-    sub[:, cols] = stage2_proba
-    proba[stage2_idx] = sub
-
-    return {
-        "pred": pred,
-        "proba": proba,
-        "classes": classes,
-        "n_splits": stage2_splits,
-        "stage1_mask": stage1_mask,
-    }
+    return {"pred": pred, "proba": proba, "classes": classes, "n_splits": n_splits}
 
 
-def fit_final_model(recommendations, X: np.ndarray, y: np.ndarray) -> TwoStagePriorityClassifier:
+def fit_final_model(X: np.ndarray, y: np.ndarray) -> LogisticRegression:
     """Fit on ALL available data - this is the model you save and reuse for
     scoring brand-new reports (not for evaluating the training set itself,
-    use cross_validated_predictions for that). Two-stage, same split as
-    cross_validated_predictions: stage 2 is fit only on the rows
-    is_monitor_only(recommendations) doesn't already resolve."""
-    recommendations = pd.Series(list(recommendations)).reset_index(drop=True)
-    X = np.asarray(X)
-    y = np.asarray(y)
-    stage1_mask = recommendations.apply(is_monitor_only).to_numpy()
-    stage2_idx = np.where(~stage1_mask)[0]
-
+    use cross_validated_predictions for that)."""
     clf = LogisticRegression(max_iter=2000, class_weight="balanced")
-    clf.fit(X[stage2_idx], y[stage2_idx])
-    return TwoStagePriorityClassifier(clf)
+    clf.fit(X, y)
+    return clf
 
 
 def flag_mismatches(
@@ -600,7 +421,7 @@ def priority_recommendation_table(flagged: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def save_bundle(clf: TwoStagePriorityClassifier, path: str | Path, embedding_model_name: str = EMBEDDING_MODEL_NAME) -> None:
+def save_bundle(clf: LogisticRegression, path: str | Path, embedding_model_name: str = EMBEDDING_MODEL_NAME) -> None:
     import joblib
 
     path = Path(path)
@@ -610,7 +431,7 @@ def save_bundle(clf: TwoStagePriorityClassifier, path: str | Path, embedding_mod
         json.dump({"embedding_model_name": embedding_model_name}, f)
 
 
-def load_bundle(path: str | Path) -> tuple[TwoStagePriorityClassifier, str]:
+def load_bundle(path: str | Path) -> tuple[LogisticRegression, str]:
     import joblib
 
     path = Path(path)
